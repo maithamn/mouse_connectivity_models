@@ -16,6 +16,8 @@ from .experiment import Experiment
 from .masks import Mask
 from ..utils import unionize
 
+import psycopg2
+import pandas as pd
 
 class _BaseData(six.with_metaclass(ABCMeta)):
 
@@ -380,6 +382,8 @@ class RegionalData(_BaseData):
     SUMMARY_STRUCTURE_SET_ID = 687527945
     DEFAULT_STRUCTURE_SET_IDS = tuple([SUMMARY_STRUCTURE_SET_ID])
 
+    
+
     @classmethod
     def from_voxel_data(cls, voxel_data):
         """Construct class from a VoxelData object.
@@ -515,6 +519,88 @@ class RegionalData(_BaseData):
                                  set(self.projection_structure_ids))
         unionizes = self.cache.get_structure_unionizes(
             experiment_ids, structure_ids=all_structure_ids)
+
+        self.uni = unionizes.copy()
+
+        # subset unionize rows
+        unionizes = self._subset_experiments_by_volume_parameters(unionizes, experiment_ids)
+        unionizes = self._subset_experiments_by_injection_hemisphere(unionizes)
+
+
+        injections = _get_data_array(
+            unionizes, True, self.normalized_injection, self.injection_hemisphere_id)
+
+        projections = _get_data_array(
+            unionizes, False, self.normalized_projection, self.projection_hemisphere_id)
+
+        # fill empty injection structures
+        missing = set(self.injection_structure_ids) - set(injections.columns.values)
+        for sid in missing:
+            injections[sid] = 0.
+
+        # projections is found using is_injection=False, add back injection
+        injections = injections.fillna(value=0.0)
+        projections = projections.add(injections).fillna(value=0.0)
+
+        # subset to structure ids
+        injections = injections[self.injection_structure_ids]
+        projections = projections[self.projection_structure_ids]
+
+        if use_dataframes:
+            self.injections = injections
+            self.projections = projections
+        else:
+            self.injections = injections.values
+            self.projections = projections.values
+
+        return self
+
+
+
+    def get_retrograde_data(self, experiment_ids, use_dataframes=False):
+        """Pulls regionalized voxel-scale grid data for experiments.
+
+        Uses the cache attribute to pull grid data from the Allen Brain Atlas.
+        Note that only experiments passing all defined parameters will be
+        included.
+
+        Parameters
+        ----------
+        experiment_ids : list
+            Ids of candidate experiments to pull. Only the subset of these
+            experiments passing user defined object parameters will be pulled.
+
+        Returns
+        -------
+        self : returns an instance of self.
+        """
+        HOSTNAME = 'limsdb2'
+        USERNAME = 'limsreader'
+        PASSWORD = 'limsro'
+        DBNAME = 'lims2'
+
+
+        def _get_data_array(unionizes, is_injection, normalized, hemisphere_id):
+            index = 'experiment_id'
+            columns = 'structure_id'
+            values = 'normalized_projection_volume' if normalized else 'projection_density'
+
+            valid_rows = (unionizes.is_injection == is_injection) &\
+                         (unionizes.hemisphere_id == hemisphere_id)
+
+            # better imo than using pd.pivot_table for safety's sake
+            return unionizes[valid_rows].pivot(index=index, columns=columns, values=values)
+
+        all_structure_ids = list(set([self.ROOT_STRUCTURE_ID]) |
+                                 set(self.injection_structure_ids) |
+                                 set(self.projection_structure_ids))
+
+        conn = psycopg2.connect(host=HOSTNAME,user=USERNAME,password=PASSWORD,dbname=DBNAME)
+        unionizes = union = pd.read_sql_query('select * from projection_structure_unionizes where image_series_id in ({})'.format(','.join([str(i) for i in experiment_ids])),conn)
+        conn.close()
+        unionizes['experiment_id'] = unionizes['image_series_id']
+
+        self.uni = unionizes.copy()
 
         # subset unionize rows
         unionizes = self._subset_experiments_by_volume_parameters(unionizes, experiment_ids)
